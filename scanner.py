@@ -1,4 +1,3 @@
-
 """
 Pump.fun Daily Runner Scanner — Single File Version
 For deployment on PythonAnywhere, Railway, or any Python host.
@@ -514,8 +513,116 @@ def run():
 
 
 # ===========================================================================
-# SCHEDULER — runs daily at SCHEDULE_HOUR:SCHEDULE_MINUTE UTC
+# TELEGRAM BOT — listens for /dailyscan command from group members
 # ===========================================================================
+
+async def poll_telegram_commands():
+    """
+    Long-polls Telegram for new messages.
+    When someone types /dailyscan in the group, triggers a full scan
+    and posts the results immediately.
+    Runs forever alongside the scheduler.
+    """
+    offset = 0
+    scan_in_progress = False
+
+    logger.info("Telegram command listener started — waiting for /dailyscan")
+
+    async with httpx.AsyncClient(
+        headers={"User-Agent": "pumpfun-scanner/1.0"},
+        follow_redirects=True
+    ) as client:
+        while True:
+            try:
+                r = await client.get(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                    params={"offset": offset, "timeout": 30, "allowed_updates": ["message"]},
+                    timeout=40,
+                )
+                data = r.json()
+
+                if not data.get("ok"):
+                    await asyncio.sleep(5)
+                    continue
+
+                for update in data.get("result", []):
+                    offset = update["update_id"] + 1
+                    msg = update.get("message", {})
+                    text = msg.get("text", "")
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
+                    user = msg.get("from", {}).get("first_name", "Someone")
+
+                    # Only respond to /dailyscan in the configured group
+                    if text.startswith("/dailyscan") and chat_id == TELEGRAM_CHAT_ID:
+                        if scan_in_progress:
+                            await send_telegram(client,
+                                "⏳ A scan is already running — please wait a minute!")
+                            continue
+
+                        logger.info(f"/dailyscan triggered by {user}")
+                        scan_in_progress = True
+
+                        # Acknowledge immediately
+                        await send_telegram(client,
+                            f"🔍 <b>Scan started by {user}...</b>\n"
+                            f"<i>Fetching pump.fun tokens, this takes ~1 minute.</i>")
+
+                        try:
+                            scan_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                            raw_tokens = await discover_tokens(client)
+                            enriched = await enrich_tokens(client, raw_tokens)
+                            passed = filter_tokens(raw_tokens, enriched)
+
+                            results = []
+                            for token, dex in passed:
+                                results.append(build_result(token, dex, len(raw_tokens)))
+                            results.sort(key=lambda x: x["volume"], reverse=True)
+                            top = results[:TOP_N]
+
+                            export_files(top, scan_date)
+                            save_results(scan_date, top)
+                            await send_results(client, top, scan_date)
+
+                        except Exception as e:
+                            logger.error(f"/dailyscan error: {e}")
+                            await send_telegram(client, f"❌ Scan failed: {e}")
+                        finally:
+                            scan_in_progress = False
+
+            except Exception as e:
+                logger.warning(f"Telegram poll error: {e}")
+                await asyncio.sleep(10)
+
+
+# ===========================================================================
+# MAIN — runs scheduler + Telegram command listener together
+# ===========================================================================
+
+async def main_async():
+    """Run both the daily scheduler and Telegram command listener concurrently."""
+    loop = asyncio.get_event_loop()
+
+    # Start APScheduler in background
+    scheduler = BlockingScheduler(timezone="UTC")
+    scheduler.add_job(
+        run,
+        CronTrigger(hour=SCHEDULE_HOUR, minute=SCHEDULE_MINUTE),
+        id="daily_scan",
+        replace_existing=True,
+        misfire_grace_time=300,
+        coalesce=True,
+    )
+
+    import threading
+    t = threading.Thread(target=scheduler.start, daemon=True)
+    t.start()
+
+    logger.info(f"Scheduler started — daily scan at {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} UTC")
+    logger.info("Telegram command listener active — /dailyscan ready")
+
+    # Run Telegram polling forever
+    await poll_telegram_commands()
+
 
 if __name__ == "__main__":
     import sys
@@ -529,20 +636,4 @@ if __name__ == "__main__":
         # Run once immediately: python scanner.py scan
         run()
     else:
-        # Run on schedule: python scanner.py
-        logger.info(f"Scheduler started — daily scan at {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} UTC")
-        logger.info("Tip: run 'python scanner.py scan' to trigger a scan right now")
-
-        scheduler = BlockingScheduler(timezone="UTC")
-        scheduler.add_job(
-            run,
-            CronTrigger(hour=SCHEDULE_HOUR, minute=SCHEDULE_MINUTE),
-            id="daily_scan",
-            replace_existing=True,
-            misfire_grace_time=300,
-            coalesce=True,
-        )
-        try:
-            scheduler.start()
-        except KeyboardInterrupt:
-            logger.info("Stopped.")
+        asyncio.run(main_async())
