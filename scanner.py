@@ -1,17 +1,7 @@
-"""
-Pump.fun Daily Runner Scanner — Single File Version
-For deployment on PythonAnywhere, Railway, or any Python host.
 
-Setup:
-  1. Set these 2 environment variables (or edit the values directly below):
-       TELEGRAM_BOT_TOKEN  = your token from BotFather
-       TELEGRAM_CHAT_ID    = your group chat ID
-
-  2. Install dependencies:
-       pip install httpx apscheduler loguru
-
-  3. Run:
-       python scanner.py
+Pump.fun Daily Runner Scanner
+Finds all pump.fun tokens with $1M+ volume, 300+ holders, no honeypots.
+Posts a clean copyable list to Telegram. Responds to /dailyscan command.
 """
 
 import asyncio
@@ -19,9 +9,9 @@ import csv
 import json
 import os
 import sqlite3
+import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional
 
 import httpx
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -29,24 +19,25 @@ from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
 
 # ===========================================================================
-# CONFIG — edit these directly if you don't want to use environment variables
+# CONFIG
 # ===========================================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip().encode('ascii', 'ignore').decode()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip().encode('ascii', 'ignore').decode()
 
-MIN_VOLUME_USD      = float(os.getenv("MIN_VOLUME_USD", "2000000"))
+MIN_VOLUME_USD      = float(os.getenv("MIN_VOLUME_USD", "1000000"))   # $1M floor
+MIN_HOLDERS         = int(os.getenv("MIN_HOLDERS", "300"))             # 300 unique holders
 MAX_TOKEN_AGE_HOURS = int(os.getenv("MAX_TOKEN_AGE_HOURS", "24"))
 MIN_LIQUIDITY_USD   = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
 MIN_TRANSACTIONS    = int(os.getenv("MIN_TRANSACTIONS", "50"))
-TOP_N               = int(os.getenv("TOP_N", "10"))
+TOP_N               = int(os.getenv("TOP_N", "20"))                    # Show up to 20 tokens
 SCHEDULE_HOUR       = int(os.getenv("SCHEDULE_HOUR", "0"))
 SCHEDULE_MINUTE     = int(os.getenv("SCHEDULE_MINUTE", "5"))
 
-PUMPFUN_API   = "https://frontend-api.pump.fun"
-DEXSCREENER   = "https://api.dexscreener.com"
-DB_PATH       = "scanner.db"
-OUTPUT_DIR    = Path("output")
+PUMPFUN_API = "https://frontend-api.pump.fun"
+DEXSCREENER = "https://api.dexscreener.com"
+DB_PATH     = "scanner.db"
+OUTPUT_DIR  = Path("output")
 
 # ===========================================================================
 # DATABASE
@@ -70,6 +61,7 @@ def init_db():
             price_change REAL,
             buys INTEGER,
             sells INTEGER,
+            holders INTEGER,
             score INTEGER,
             label TEXT,
             flags TEXT,
@@ -99,14 +91,15 @@ def save_results(scan_date, tokens):
         conn.execute("""
             INSERT INTO results
             (scan_date,rank,mint,name,symbol,url,age_hours,volume,liquidity,
-             market_cap,price_change,buys,sells,score,label,flags,created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             market_cap,price_change,buys,sells,holders,score,label,flags,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             scan_date, rank,
             t["mint"], t["name"], t["symbol"], t["url"],
             t["age_hours"], t["volume"], t["liquidity"],
             t.get("market_cap"), t["price_change"],
-            t["buys"], t["sells"], t["score"], t["label"],
+            t["buys"], t["sells"], t.get("holders", 0),
+            t["score"], t["label"],
             json.dumps(t["flags"]),
             datetime.now(timezone.utc).isoformat()
         ))
@@ -116,18 +109,25 @@ def save_results(scan_date, tokens):
             INSERT OR REPLACE INTO daily
             (scan_date,discovered,passed,winner_name,winner_symbol,winner_volume,winner_score)
             VALUES (?,?,?,?,?,?,?)
-        """, (scan_date, t.get("discovered",0), len(tokens),
+        """, (scan_date, t.get("discovered", 0), len(tokens),
               w["name"], w["symbol"], w["volume"], w["score"]))
     conn.commit()
     conn.close()
 
 
 # ===========================================================================
-# STEP 1 — DISCOVER tokens from pump.fun
+# STEP 1 — DISCOVER tokens from pump.fun (includes holder_count)
 # ===========================================================================
 
 async def discover_tokens(client):
-    cutoff_ms = int((datetime.now(timezone.utc) - timedelta(hours=MAX_TOKEN_AGE_HOURS)).timestamp() * 1000)
+    """
+    Fetches tokens from pump.fun sorted by creation time (newest first).
+    pump.fun returns holder_count per token — we use this for the 300 holder filter.
+    Stops once all tokens on a page are older than MAX_TOKEN_AGE_HOURS.
+    """
+    cutoff_ms = int(
+        (datetime.now(timezone.utc) - timedelta(hours=MAX_TOKEN_AGE_HOURS)).timestamp() * 1000
+    )
     tokens = []
     offset = 0
 
@@ -135,12 +135,18 @@ async def discover_tokens(client):
         try:
             r = await client.get(
                 f"{PUMPFUN_API}/coins",
-                params={"offset": offset, "limit": 50, "sort": "created_timestamp", "order": "DESC"},
-                timeout=20
+                params={
+                    "offset": offset,
+                    "limit": 50,
+                    "sort": "created_timestamp",
+                    "order": "DESC",
+                    "includeNsfw": "false",
+                },
+                timeout=20,
             )
             data = r.json()
         except Exception as e:
-            logger.error(f"Pump.fun error page {page}: {e}")
+            logger.error(f"Pump.fun error page {page+1}: {e}")
             break
 
         if not data or not isinstance(data, list):
@@ -148,6 +154,7 @@ async def discover_tokens(client):
 
         found_old = False
         page_tokens = []
+
         for item in data:
             ts = item.get("created_timestamp", 0)
             mint = item.get("mint", "").strip()
@@ -156,11 +163,16 @@ async def discover_tokens(client):
             if ts < cutoff_ms:
                 found_old = True
                 continue
+
+            # holder_count comes directly from pump.fun API
+            holders = item.get("holder_count") or item.get("holders") or 0
+
             page_tokens.append({
                 "mint": mint,
                 "name": item.get("name") or "Unknown",
                 "symbol": item.get("symbol") or "?",
                 "created_ms": ts,
+                "holders": int(holders),
             })
 
         tokens.extend(page_tokens)
@@ -173,12 +185,12 @@ async def discover_tokens(client):
         offset += 50
         await asyncio.sleep(0.25)
 
-    logger.info(f"Discovered {len(tokens)} tokens from pump.fun")
+    logger.info(f"Discovered {len(tokens)} pump.fun tokens in last {MAX_TOKEN_AGE_HOURS}h")
     return tokens
 
 
 # ===========================================================================
-# STEP 2 — ENRICH with Dexscreener
+# STEP 2 — ENRICH with Dexscreener (volume, liquidity, txns)
 # ===========================================================================
 
 async def enrich_tokens(client, tokens):
@@ -187,11 +199,11 @@ async def enrich_tokens(client, tokens):
     batch_size = 30
 
     for i in range(0, len(mints), batch_size):
-        batch = mints[i:i+batch_size]
+        batch = mints[i:i + batch_size]
         try:
             r = await client.get(
                 f"{DEXSCREENER}/latest/dex/tokens/{','.join(batch)}",
-                timeout=20
+                timeout=20,
             )
             data = r.json()
             pairs = data.get("pairs") or []
@@ -206,8 +218,6 @@ async def enrich_tokens(client, tokens):
                 if mint not in enriched or vol > enriched[mint]["volume"]:
                     liq = float((pair.get("liquidity") or {}).get("usd") or 0)
                     txns_h24 = pair.get("txns", {}).get("h24", {})
-                    buys = int(txns_h24.get("buys") or 0)
-                    sells = int(txns_h24.get("sells") or 0)
                     enriched[mint] = {
                         "url": pair.get("url", ""),
                         "dex": pair.get("dexId", ""),
@@ -216,12 +226,12 @@ async def enrich_tokens(client, tokens):
                         "market_cap": pair.get("marketCap"),
                         "price_usd": pair.get("priceUsd"),
                         "price_change": float((pair.get("priceChange") or {}).get("h24") or 0),
-                        "buys": buys,
-                        "sells": sells,
+                        "buys": int(txns_h24.get("buys") or 0),
+                        "sells": int(txns_h24.get("sells") or 0),
                         "pair_created_ms": pair.get("pairCreatedAt"),
                     }
         except Exception as e:
-            logger.warning(f"Dexscreener batch {i//batch_size+1} error: {e}")
+            logger.warning(f"Dexscreener batch {i // batch_size + 1} error: {e}")
         await asyncio.sleep(0.25)
 
     logger.info(f"Enriched: {len(enriched)}/{len(mints)} tokens found on Dexscreener")
@@ -229,46 +239,69 @@ async def enrich_tokens(client, tokens):
 
 
 # ===========================================================================
-# STEP 3 — FILTER
+# STEP 3 — FILTER (volume, holders, honeypot, wash trading, liquidity)
 # ===========================================================================
 
 def filter_tokens(tokens, enriched):
     passed = []
-    stats = {"no_dex": 0, "low_vol": 0, "low_liq": 0, "few_txns": 0, "honeypot": 0, "wash": 0}
+    stats = {
+        "no_dex": 0, "low_vol": 0, "low_holders": 0,
+        "low_liq": 0, "few_txns": 0, "honeypot": 0, "wash": 0
+    }
 
     for t in tokens:
         dex = enriched.get(t["mint"])
+
+        # Not on Dexscreener yet
         if not dex:
             stats["no_dex"] += 1
             continue
+
+        # Volume floor: $1M
         if dex["volume"] < MIN_VOLUME_USD:
             stats["low_vol"] += 1
             continue
+
+        # Holder floor: 300 unique holders (from pump.fun API)
+        if t.get("holders", 0) < MIN_HOLDERS:
+            stats["low_holders"] += 1
+            continue
+
+        # Minimum liquidity
         if dex["liquidity"] < MIN_LIQUIDITY_USD:
             stats["low_liq"] += 1
             continue
+
+        # Minimum transactions
         if dex["buys"] + dex["sells"] < MIN_TRANSACTIONS:
             stats["few_txns"] += 1
             continue
+
+        # Honeypot: many buys, zero sells
         if dex["buys"] >= 20 and dex["sells"] == 0:
             stats["honeypot"] += 1
+            logger.debug(f"Honeypot: {t['symbol']} buys={dex['buys']} sells=0")
             continue
+
+        # Extreme wash trading: vol/liq > 1000x
         if dex["liquidity"] > 0 and dex["volume"] / dex["liquidity"] > 1000:
             stats["wash"] += 1
+            logger.debug(f"Wash trade: {t['symbol']} ratio={dex['volume']/dex['liquidity']:.0f}x")
             continue
+
         passed.append((t, dex))
 
     logger.info(
-        f"Filters — no_dex:{stats['no_dex']} low_vol:{stats['low_vol']} "
-        f"low_liq:{stats['low_liq']} few_txns:{stats['few_txns']} "
-        f"honeypot:{stats['honeypot']} wash:{stats['wash']} "
-        f"✅ passed:{len(passed)}"
+        f"Filters — no_dex:{stats['no_dex']} | low_vol:{stats['low_vol']} | "
+        f"low_holders:{stats['low_holders']} | low_liq:{stats['low_liq']} | "
+        f"few_txns:{stats['few_txns']} | honeypot:{stats['honeypot']} | "
+        f"wash:{stats['wash']} | passed:{len(passed)}"
     )
     return passed
 
 
 # ===========================================================================
-# STEP 4 — SCORE
+# STEP 4 — SCORE (manipulation risk 0-100)
 # ===========================================================================
 
 def score_token(dex):
@@ -284,11 +317,14 @@ def score_token(dex):
     # Vol/liq ratio
     ratio = vol / liq
     if ratio > 500:
-        score += 30; flags.append(f"Extreme vol/liq ratio ({ratio:.0f}x)")
+        score += 30
+        flags.append(f"Extreme vol/liq ratio ({ratio:.0f}x)")
     elif ratio > 200:
-        score += 20; flags.append(f"Very high vol/liq ratio ({ratio:.0f}x)")
+        score += 20
+        flags.append(f"Very high vol/liq ratio ({ratio:.0f}x)")
     elif ratio > 100:
-        score += 10; flags.append(f"Elevated vol/liq ratio ({ratio:.0f}x)")
+        score += 10
+        flags.append(f"Elevated vol/liq ratio ({ratio:.0f}x)")
     elif ratio > 50:
         score += 4
 
@@ -296,9 +332,11 @@ def score_token(dex):
     if total > 0 and sells > 0:
         buy_ratio = buys / total
         if buy_ratio > 0.95:
-            score += 20; flags.append(f"Extreme buy ratio ({buy_ratio:.0%})")
+            score += 20
+            flags.append(f"Extreme buy ratio ({buy_ratio:.0%})")
         elif buy_ratio > 0.90:
-            score += 12; flags.append(f"High buy ratio ({buy_ratio:.0%})")
+            score += 12
+            flags.append(f"High buy ratio ({buy_ratio:.0%})")
         elif buy_ratio > 0.85:
             score += 5
 
@@ -306,25 +344,34 @@ def score_token(dex):
     if total > 0:
         avg = vol / total
         if avg > 100_000:
-            score += 20; flags.append(f"Huge avg txn size (${avg:,.0f})")
+            score += 20
+            flags.append(f"Huge avg txn size (${avg:,.0f})")
         elif avg > 50_000:
-            score += 14; flags.append(f"Large avg txn size (${avg:,.0f})")
+            score += 14
+            flags.append(f"Large avg txn size (${avg:,.0f})")
         elif avg > 20_000:
-            score += 8; flags.append(f"Elevated avg txn size (${avg:,.0f})")
+            score += 8
+            flags.append(f"Elevated avg txn size (${avg:,.0f})")
 
     # Liq/mcap
     if mcap > 0:
         lm = liq / mcap
         if lm < 0.003:
-            score += 15; flags.append(f"Dangerous liq/mcap ratio ({lm:.2%})")
+            score += 15
+            flags.append(f"Dangerous liq/mcap ratio ({lm:.2%})")
         elif lm < 0.01:
-            score += 8; flags.append(f"Low liq/mcap ratio ({lm:.2%})")
+            score += 8
+            flags.append(f"Low liq/mcap ratio ({lm:.2%})")
 
     score = min(score, 100)
-    if score <= 20:   label = "Organic"
-    elif score <= 40: label = "Likely Organic"
-    elif score <= 65: label = "Suspicious"
-    else:             label = "Likely Manipulated"
+    if score <= 20:
+        label = "Organic"
+    elif score <= 40:
+        label = "Likely Organic"
+    elif score <= 65:
+        label = "Suspicious"
+    else:
+        label = "Likely Manipulated"
 
     return score, label, flags
 
@@ -351,6 +398,7 @@ def build_result(token, dex, discovered_count):
         "price_change": dex["price_change"],
         "buys": dex["buys"],
         "sells": dex["sells"],
+        "holders": token.get("holders", 0),
         "score": score,
         "label": label,
         "flags": flags,
@@ -359,16 +407,25 @@ def build_result(token, dex, discovered_count):
 
 
 # ===========================================================================
-# STEP 5 — TELEGRAM
+# STEP 5 — TELEGRAM FORMATTING + SENDING
 # ===========================================================================
 
 def fmt(v):
-    if v >= 1_000_000: return f"${v/1_000_000:.1f}M"
-    if v >= 1_000:     return f"${v/1_000:.0f}K"
+    if v >= 1_000_000:
+        return f"${v / 1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"${v / 1_000:.0f}K"
     return f"${v:.0f}"
 
+
 def risk_emoji(label):
-    return {"Organic":"✅","Likely Organic":"🟢","Suspicious":"🟡","Likely Manipulated":"🔴"}.get(label,"❓")
+    return {
+        "Organic": "✅",
+        "Likely Organic": "🟢",
+        "Suspicious": "🟡",
+        "Likely Manipulated": "🔴",
+    }.get(label, "❓")
+
 
 async def send_telegram(client, text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -377,81 +434,129 @@ async def send_telegram(client, text):
     try:
         r = await client.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML",
-                  "disable_web_page_preview": True},
-            timeout=15
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
         )
-        if r.json().get("ok"):
+        result = r.json()
+        if result.get("ok"):
             logger.info("Telegram message sent ✅")
         else:
-            logger.error(f"Telegram error: {r.json()}")
+            logger.error(f"Telegram error: {result.get('description')}")
     except Exception as e:
         logger.error(f"Telegram send failed: {e}")
 
 
+def build_token_list_message(tokens, scan_date):
+    """
+    Builds a clean Telegram message listing all runners.
+    Token name is bold, contract address is in <code> tags
+    so users can tap to copy it directly in Telegram.
+    """
+    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    lines = [
+        f"🔥 <b>Pump.fun Runners — {scan_date}</b>",
+        f"<i>{len(tokens)} tokens | $1M+ vol | 300+ holders | no honeypots</i>",
+        f"<i>Scan time: {now_str}</i>\n",
+    ]
+
+    for i, t in enumerate(tokens, 1):
+        emoji = risk_emoji(t["label"])
+        vol = fmt(t["volume"])
+        mcap = fmt(t["market_cap"]) if t.get("market_cap") else "N/A"
+        holders = f"{t.get('holders', 0):,}"
+        pc = f"{t['price_change']:+.0f}%"
+        age = f"{t['age_hours']:.1f}h"
+        score = t["score"]
+
+        # Medal for top 3
+        rank_icon = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
+
+        lines.append(
+            f"{rank_icon} <b>{t['name']}</b> <code>${t['symbol']}</code>\n"
+            f"   Vol: <b>{vol}</b> | MCap: {mcap} | {pc} | {age} old\n"
+            f"   Holders: {holders} | Risk: {emoji} {score}/100\n"
+            f"   CA: <code>{t['mint']}</code>\n"
+            f"   <a href=\"{t['url']}\">Dexscreener</a>"
+        )
+
+    return "\n".join(lines)
+
+
 async def send_results(client, tokens, scan_date):
+    """
+    Sends results as a paginated list (Telegram max 4096 chars per message).
+    Splits into multiple messages if needed.
+    """
     if not tokens:
-        await send_telegram(client,
-            f"📭 <b>Pump.fun scan — {scan_date}</b>\n\nNo tokens crossed ${MIN_VOLUME_USD/1e6:.0f}M volume today.")
+        await send_telegram(
+            client,
+            f"📭 <b>Pump.fun scan — {scan_date}</b>\n\n"
+            f"No tokens matched today's criteria:\n"
+            f"• $1M+ volume\n"
+            f"• 300+ holders\n"
+            f"• No honeypots\n"
+            f"• No extreme wash trading",
+        )
         return
 
-    w = tokens[0]
-    emoji = risk_emoji(w["label"])
-    mcap = fmt(w["market_cap"]) if w.get("market_cap") else "N/A"
-    flags_text = "\n".join(f"  ⚠️ {f}" for f in w["flags"][:2]) if w["flags"] else ""
-    risk_section = f"\n<b>Risk flags:</b>\n{flags_text}" if flags_text else "\n✅ <i>No major risk flags</i>"
+    # Split into chunks of 5 tokens per message to stay under 4096 char limit
+    chunk_size = 5
+    chunks = [tokens[i:i + chunk_size] for i in range(0, len(tokens), chunk_size)]
 
-    winner_msg = (
-        f"🏆 <b>RUNNER OF THE DAY — {scan_date}</b>\n"
-        f"{'─'*32}\n\n"
-        f"<b>{w['name']}</b>  <code>${w['symbol']}</code>\n\n"
-        f"📊 <b>Volume 24h:</b>  <b>{fmt(w['volume'])}</b>\n"
-        f"💧 <b>Liquidity:</b>   {fmt(w['liquidity'])}\n"
-        f"🏦 <b>Mkt Cap:</b>     {mcap}\n"
-        f"📈 <b>Price chg:</b>   {w['price_change']:+.0f}%\n"
-        f"⏱ <b>Age:</b>         {w['age_hours']:.1f}h\n"
-        f"🔁 <b>Txns:</b>        {w['buys']+w['sells']:,} (B:{w['buys']:,} / S:{w['sells']:,})\n\n"
-        f"{emoji} <b>Risk score:</b> {w['score']}/100 — {w['label']}"
-        f"{risk_section}\n\n"
-        f"🔗 <a href=\"{w['url']}\">View on Dexscreener</a>\n"
-        f"<code>{w['mint']}</code>"
-    )
-    await send_telegram(client, winner_msg)
+    for idx, chunk in enumerate(chunks):
+        if idx == 0:
+            msg = build_token_list_message(chunk, scan_date)
+            # Add summary header only to first message
+        else:
+            # Continuation messages
+            lines = [f"<i>...continued ({idx * chunk_size + 1}–{min((idx + 1) * chunk_size, len(tokens))} of {len(tokens)})</i>\n"]
+            for i, t in enumerate(chunk, idx * chunk_size + 1):
+                emoji = risk_emoji(t["label"])
+                vol = fmt(t["volume"])
+                mcap = fmt(t["market_cap"]) if t.get("market_cap") else "N/A"
+                holders = f"{t.get('holders', 0):,}"
+                pc = f"{t['price_change']:+.0f}%"
+                age = f"{t['age_hours']:.1f}h"
+                score = t["score"]
+                lines.append(
+                    f"{i}. <b>{t['name']}</b> <code>${t['symbol']}</code>\n"
+                    f"   Vol: <b>{vol}</b> | MCap: {mcap} | {pc} | {age} old\n"
+                    f"   Holders: {holders} | Risk: {emoji} {score}/100\n"
+                    f"   CA: <code>{t['mint']}</code>\n"
+                    f"   <a href=\"{t['url']}\">Dexscreener</a>"
+                )
+            msg = "\n".join(lines)
 
-    if len(tokens) > 1:
-        lines = [f"📋 <b>Top {len(tokens)} runners — {scan_date}</b>\n"]
-        for i, t in enumerate(tokens, 1):
-            icon = {1:"🥇",2:"🥈",3:"🥉"}.get(i, f"{i}.")
-            lines.append(
-                f"{icon} <b>{t['symbol']}</b> — {fmt(t['volume'])} "
-                f"{risk_emoji(t['label'])} <i>{t['score']}/100</i>\n"
-                f"   <a href=\"{t['url']}\">Dexscreener</a> · {t['age_hours']:.1f}h · {t['buys']+t['sells']:,} txns"
-            )
-        lines.append(f"\n<i>Scan: {datetime.now(timezone.utc).strftime('%H:%M UTC')}</i>")
-        await send_telegram(client, "\n".join(lines))
+        await send_telegram(client, msg)
+        await asyncio.sleep(0.5)  # Small delay between messages
 
 
 # ===========================================================================
-# STEP 6 — EXPORT
+# STEP 6 — EXPORT (JSON + CSV)
 # ===========================================================================
 
 def export_files(tokens, scan_date):
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    # JSON
     with open(OUTPUT_DIR / f"{scan_date}_runners.json", "w") as f:
         json.dump({"scan_date": scan_date, "results": tokens}, f, indent=2, default=str)
 
-    # CSV
     if tokens:
-        fields = ["rank","name","symbol","mint","url","age_hours","volume",
-                  "liquidity","market_cap","price_change","buys","sells","score","label"]
+        fields = ["rank", "name", "symbol", "mint", "url", "age_hours", "volume",
+                  "liquidity", "market_cap", "price_change", "buys", "sells",
+                  "holders", "score", "label"]
         with open(OUTPUT_DIR / f"{scan_date}_runners.csv", "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
             w.writeheader()
             for rank, t in enumerate(tokens, 1):
-                row = dict(t); row["rank"] = rank
-                w.writerow({k: row.get(k,"") for k in fields})
+                row = dict(t)
+                row["rank"] = rank
+                w.writerow({k: row.get(k, "") for k in fields})
 
     logger.info(f"Exported {len(tokens)} results to output/")
 
@@ -460,52 +565,54 @@ def export_files(tokens, scan_date):
 # MAIN SCAN PIPELINE
 # ===========================================================================
 
-async def run_scan():
+async def run_scan(client=None):
+    """
+    Full pipeline. Can be called with an existing client (from command handler)
+    or creates its own (when called from scheduler).
+    """
     scan_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    logger.info(f"{'='*50}")
+    logger.info("=" * 50)
     logger.info(f"Starting scan — {scan_date}")
-    logger.info(f"{'='*50}")
+    logger.info("=" * 50)
 
     init_db()
 
-    async with httpx.AsyncClient(
-        headers={"User-Agent": "pumpfun-scanner/1.0", "Accept": "application/json"},
-        follow_redirects=True
-    ) as client:
-        # 1. Discover
-        raw_tokens = await discover_tokens(client)
+    async def _scan(c):
+        raw_tokens = await discover_tokens(c)
         if not raw_tokens:
             logger.warning("No tokens discovered")
-            await send_telegram(client, f"⚠️ Scan ran but pump.fun API returned no tokens ({scan_date})")
+            await send_telegram(c, f"⚠️ Scan ran but pump.fun API returned no tokens ({scan_date})")
             return []
 
-        # 2. Enrich
-        enriched = await enrich_tokens(client, raw_tokens)
-
-        # 3. Filter
+        enriched = await enrich_tokens(c, raw_tokens)
         passed = filter_tokens(raw_tokens, enriched)
-        logger.info(f"Pipeline: {len(raw_tokens)} → {len(enriched)} on Dex → {len(passed)} passed")
+
+        logger.info(f"Pipeline: {len(raw_tokens)} discovered → {len(enriched)} on Dex → {len(passed)} passed filters")
 
         if not passed:
-            logger.warning("No tokens passed filters")
-            await send_results(client, [], scan_date)
+            await send_results(c, [], scan_date)
             return []
 
-        # 4. Score + rank
         results = []
         for token, dex in passed:
-            r = build_result(token, dex, len(raw_tokens))
-            results.append(r)
+            results.append(build_result(token, dex, len(raw_tokens)))
         results.sort(key=lambda x: x["volume"], reverse=True)
         top = results[:TOP_N]
 
-        # 5. Output
-        logger.info(f"Winner: {top[0]['symbol']} vol=${top[0]['volume']:,.0f} score={top[0]['score']}/100")
+        logger.info(f"Winner: {top[0]['symbol']} vol=${top[0]['volume']:,.0f} holders={top[0]['holders']}")
         export_files(top, scan_date)
         save_results(scan_date, top)
-        await send_results(client, top, scan_date)
-
+        await send_results(c, top, scan_date)
         return top
+
+    if client:
+        return await _scan(client)
+    else:
+        async with httpx.AsyncClient(
+            headers={"User-Agent": "pumpfun-scanner/1.0", "Accept": "application/json"},
+            follow_redirects=True,
+        ) as c:
+            return await _scan(c)
 
 
 def run():
@@ -513,30 +620,33 @@ def run():
 
 
 # ===========================================================================
-# TELEGRAM BOT — listens for /dailyscan command from group members
+# TELEGRAM BOT — listens for /dailyscan command
 # ===========================================================================
 
 async def poll_telegram_commands():
     """
-    Long-polls Telegram for new messages.
-    When someone types /dailyscan in the group, triggers a full scan
-    and posts the results immediately.
-    Runs forever alongside the scheduler.
+    Long-polls Telegram for /dailyscan command.
+    Anyone in the group can trigger a scan.
+    Prevents concurrent scans.
     """
     offset = 0
     scan_in_progress = False
 
-    logger.info("Telegram command listener started — waiting for /dailyscan")
+    logger.info("Telegram command listener started — /dailyscan ready")
 
     async with httpx.AsyncClient(
         headers={"User-Agent": "pumpfun-scanner/1.0"},
-        follow_redirects=True
+        follow_redirects=True,
     ) as client:
         while True:
             try:
                 r = await client.get(
                     f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-                    params={"offset": offset, "timeout": 30, "allowed_updates": ["message"]},
+                    params={
+                        "offset": offset,
+                        "timeout": 30,
+                        "allowed_updates": ["message"],
+                    },
                     timeout=40,
                 )
                 data = r.json()
@@ -548,41 +658,29 @@ async def poll_telegram_commands():
                 for update in data.get("result", []):
                     offset = update["update_id"] + 1
                     msg = update.get("message", {})
-                    text = msg.get("text", "")
+                    text = (msg.get("text") or "").strip()
                     chat_id = str(msg.get("chat", {}).get("id", ""))
                     user = msg.get("from", {}).get("first_name", "Someone")
 
-                    # Only respond to /dailyscan in the configured group
                     if text.startswith("/dailyscan") and chat_id == TELEGRAM_CHAT_ID:
                         if scan_in_progress:
-                            await send_telegram(client,
-                                "⏳ A scan is already running — please wait a minute!")
+                            await send_telegram(
+                                client,
+                                "⏳ A scan is already running — please wait a minute!",
+                            )
                             continue
 
                         logger.info(f"/dailyscan triggered by {user}")
                         scan_in_progress = True
 
-                        # Acknowledge immediately
-                        await send_telegram(client,
+                        await send_telegram(
+                            client,
                             f"🔍 <b>Scan started by {user}...</b>\n"
-                            f"<i>Fetching pump.fun tokens, this takes ~1 minute.</i>")
+                            f"<i>Fetching pump.fun tokens, this takes ~1 minute.</i>",
+                        )
 
                         try:
-                            scan_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                            raw_tokens = await discover_tokens(client)
-                            enriched = await enrich_tokens(client, raw_tokens)
-                            passed = filter_tokens(raw_tokens, enriched)
-
-                            results = []
-                            for token, dex in passed:
-                                results.append(build_result(token, dex, len(raw_tokens)))
-                            results.sort(key=lambda x: x["volume"], reverse=True)
-                            top = results[:TOP_N]
-
-                            export_files(top, scan_date)
-                            save_results(scan_date, top)
-                            await send_results(client, top, scan_date)
-
+                            await run_scan(client=client)
                         except Exception as e:
                             logger.error(f"/dailyscan error: {e}")
                             await send_telegram(client, f"❌ Scan failed: {e}")
@@ -595,14 +693,12 @@ async def poll_telegram_commands():
 
 
 # ===========================================================================
-# MAIN — runs scheduler + Telegram command listener together
+# MAIN — scheduler + Telegram command listener running together
 # ===========================================================================
 
 async def main_async():
-    """Run both the daily scheduler and Telegram command listener concurrently."""
-    loop = asyncio.get_event_loop()
+    init_db()
 
-    # Start APScheduler in background
     scheduler = BlockingScheduler(timezone="UTC")
     scheduler.add_job(
         run,
@@ -613,14 +709,12 @@ async def main_async():
         coalesce=True,
     )
 
-    import threading
     t = threading.Thread(target=scheduler.start, daemon=True)
     t.start()
 
     logger.info(f"Scheduler started — daily scan at {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} UTC")
     logger.info("Telegram command listener active — /dailyscan ready")
 
-    # Run Telegram polling forever
     await poll_telegram_commands()
 
 
@@ -628,12 +722,14 @@ if __name__ == "__main__":
     import sys
 
     logger.remove()
-    logger.add(sys.stderr, level="INFO",
-               format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | {message}")
+    logger.add(
+        sys.stderr,
+        level="INFO",
+        format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | {message}",
+    )
     logger.add("scanner.log", level="DEBUG", rotation="1 day", retention="14 days")
 
     if len(sys.argv) > 1 and sys.argv[1] == "scan":
-        # Run once immediately: python scanner.py scan
         run()
     else:
         asyncio.run(main_async())
