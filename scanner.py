@@ -171,6 +171,8 @@ async def discover_tokens(client):
         website_url = websites[0].get("url", "") if websites else ""
         twitter_url = next((s.get("url","") for s in socials if s.get("type") == "twitter"), "")
         if mint not in tokens or vol > tokens[mint].get("volume", 0):
+            # Dexscreener uses "pairAddress" in search results
+            pair_addr = (pair.get("pairAddress") or pair.get("pair_address") or "").strip()
             tokens[mint] = {
                 "mint": mint,
                 "name": base.get("name") or "Unknown",
@@ -181,7 +183,7 @@ async def discover_tokens(client):
                 "buys": buys,
                 "sells": sells,
                 "url": pair.get("url", ""),
-                "pair_address": pair.get("pairAddress", ""),
+                "pair_address": pair_addr,
                 "price_usd": pair.get("priceUsd", "0"),
                 "dex": dex_id,
                 "market_cap": pair.get("marketCap"),
@@ -277,12 +279,11 @@ def filter_tokens(tokens, enriched):
 # ===========================================================================
 
 async def get_top_traders(client, pair_address, mint):
-    """
-    Fetches top traders from Dexscreener's internal API.
-    This is the same data shown in the Top Traders tab on the pair page.
-    """
     if not pair_address:
+        logger.warning(f"Top traders: no pair_address for {mint[:8]}")
         return {}
+
+    logger.info(f"Fetching top traders for pair {pair_address[:12]}...")
 
     result = {
         "trader_count": 0,
@@ -292,97 +293,108 @@ async def get_top_traders(client, pair_address, mint):
         "top_traders": [],
     }
 
-    try:
-        # Dexscreener's top traders endpoint (powers their UI tab)
-        r = await client.get(
-            f"{DEXSCREENER_IO}/dex/top-traders/v2/solana/{pair_address}",
-            params={"rankBy": "profitAndLoss", "order": "desc"},
-            headers={
-                "Accept": "application/json",
-                "Origin": "https://dexscreener.com",
-                "Referer": f"https://dexscreener.com/solana/{pair_address}",
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            },
-            timeout=15,
+    # Try multiple endpoint formats since Dexscreener's internal API may vary
+    endpoints = [
+        f"{DEXSCREENER_IO}/dex/top-traders/v2/solana/{pair_address}",
+        f"{DEXSCREENER_IO}/dex/top-traders/solana/{pair_address}",
+        f"{DEXSCREENER}/latest/dex/pairs/solana/{pair_address}",
+    ]
+
+    traders_raw = []
+    for endpoint in endpoints:
+        try:
+            r = await client.get(
+                endpoint,
+                params={"rankBy": "profitAndLoss", "order": "desc"},
+                headers={
+                    "Accept": "application/json",
+                    "Origin": "https://dexscreener.com",
+                    "Referer": f"https://dexscreener.com/solana/{pair_address}",
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                },
+                timeout=15,
+            )
+            logger.info(f"Top traders endpoint {endpoint.split('/')[-3]}: status {r.status_code}")
+
+            if r.status_code == 200:
+                data = r.json()
+                # Try different response structures
+                if isinstance(data, list):
+                    traders_raw = data
+                elif isinstance(data, dict):
+                    traders_raw = (
+                        data.get("topTraders") or
+                        data.get("traders") or
+                        data.get("data") or
+                        []
+                    )
+                    # If it's pairs endpoint, log the keys so we can debug
+                    if not traders_raw:
+                        logger.info(f"Response keys: {list(data.keys())[:10]}")
+                if traders_raw:
+                    logger.info(f"Got {len(traders_raw)} traders from {endpoint.split('/')[-3]}")
+                    break
+        except Exception as e:
+            logger.warning(f"Top traders endpoint error: {e}")
+        await asyncio.sleep(0.3)
+
+    if not traders_raw:
+        logger.warning(f"Top traders: no data found for {pair_address[:12]}")
+        return result
+
+    traders_raw = traders_raw[:30]
+    entries = []
+    exits = []
+    total_pnl = 0.0
+    profitable_count = 0
+    trader_summaries = []
+
+    for trader in traders_raw:
+        pnl = float(
+            trader.get("profitAndLoss") or trader.get("pnl") or
+            trader.get("realizedProfit") or trader.get("realizedPnl") or 0
         )
-
-        if r.status_code != 200:
-            logger.debug(f"Top traders: {r.status_code} for pair {pair_address[:8]}")
-            return result
-
-        data = r.json()
-        # Dexscreener returns the top traders as a list
-        traders_raw = data if isinstance(data, list) else (data.get("data") or data.get("traders") or [])
-
-        if not traders_raw:
-            return result
-
-        # Limit to top 30
-        traders_raw = traders_raw[:30]
-
-        entries = []
-        exits = []
-        total_pnl = 0.0
-        profitable_count = 0
-        trader_summaries = []
-
-        for trader in traders_raw:
-            # Different possible field names from Dexscreener
-            pnl = float(
-                trader.get("profitAndLoss") or
-                trader.get("pnl") or
-                trader.get("realizedProfit") or 0
-            )
-            bought_usd = float(
-                trader.get("volumeBought") or
-                trader.get("bought") or
-                trader.get("boughtAmountUsd") or 0
-            )
-            sold_usd = float(
-                trader.get("volumeSold") or
-                trader.get("sold") or
-                trader.get("soldAmountUsd") or 0
-            )
-            bought_tokens = float(trader.get("tokensBought") or trader.get("boughtAmount") or 0)
-            sold_tokens = float(trader.get("tokensSold") or trader.get("soldAmount") or 0)
-            wallet = trader.get("address") or trader.get("maker") or "?"
-
-            # Avg entry = USD spent / tokens bought
-            if bought_tokens > 0 and bought_usd > 0:
-                avg_entry = bought_usd / bought_tokens
-                entries.append(avg_entry)
-
-            # Avg exit = USD received / tokens sold
-            if sold_tokens > 0 and sold_usd > 0:
-                avg_exit = sold_usd / sold_tokens
-                exits.append(avg_exit)
-
-            if pnl > 0:
-                total_pnl += pnl
-                profitable_count += 1
-
-            trader_summaries.append({
-                "wallet": wallet[:8] + "..." if len(wallet) > 8 else wallet,
-                "pnl_usd": round(pnl, 2),
-                "bought_usd": round(bought_usd, 2),
-                "sold_usd": round(sold_usd, 2),
-            })
-
-        result["trader_count"] = len(traders_raw)
-        result["total_extracted"] = round(total_pnl, 2)
-        result["avg_entry"] = round(sum(entries) / len(entries), 10) if entries else 0
-        result["avg_exit"] = round(sum(exits) / len(exits), 10) if exits else 0
-        result["profitable_count"] = profitable_count
-        result["top_traders"] = trader_summaries[:5]  # Store top 5 for display
-
-        logger.info(
-            f"Top traders for {mint[:8]}: {len(traders_raw)} traders, "
-            f"extracted=${total_pnl:,.0f}"
+        bought_usd = float(
+            trader.get("volumeBought") or trader.get("bought") or
+            trader.get("boughtAmountUsd") or trader.get("buyAmountUsd") or 0
         )
+        sold_usd = float(
+            trader.get("volumeSold") or trader.get("sold") or
+            trader.get("soldAmountUsd") or trader.get("sellAmountUsd") or 0
+        )
+        bought_tokens = float(
+            trader.get("tokensBought") or trader.get("boughtAmount") or
+            trader.get("buyAmount") or 0
+        )
+        sold_tokens = float(
+            trader.get("tokensSold") or trader.get("soldAmount") or
+            trader.get("sellAmount") or 0
+        )
+        wallet = trader.get("address") or trader.get("maker") or trader.get("wallet") or "?"
 
-    except Exception as e:
-        logger.warning(f"Top traders error for {pair_address[:8]}: {e}")
+        if bought_tokens > 0 and bought_usd > 0:
+            entries.append(bought_usd / bought_tokens)
+        if sold_tokens > 0 and sold_usd > 0:
+            exits.append(sold_usd / sold_tokens)
+        if pnl > 0:
+            total_pnl += pnl
+            profitable_count += 1
 
+        trader_summaries.append({
+            "wallet": wallet[:8] + "..." if len(wallet) > 8 else wallet,
+            "pnl_usd": round(pnl, 2),
+            "bought_usd": round(bought_usd, 2),
+            "sold_usd": round(sold_usd, 2),
+        })
+
+    result["trader_count"] = len(traders_raw)
+    result["total_extracted"] = round(total_pnl, 2)
+    result["avg_entry"] = round(sum(entries) / len(entries), 12) if entries else 0
+    result["avg_exit"] = round(sum(exits) / len(exits), 12) if exits else 0
+    result["profitable_count"] = profitable_count
+    result["top_traders"] = trader_summaries[:5]
+
+    logger.info(f"Top traders {mint[:8]}: {len(traders_raw)} traders, extracted=${total_pnl:,.0f}")
     return result
 
 
