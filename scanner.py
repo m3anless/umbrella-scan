@@ -1,6 +1,6 @@
 
 Pump.fun Daily Runner Scanner
-Finds all pump.fun tokens with $1M+ volume, 300+ holders, no honeypots.
+Finds all pump.fun tokens with 1M+ volume, 300+ holders, no honeypots.
 Posts a clean copyable list to Telegram. Responds to /dailyscan command.
 """
 
