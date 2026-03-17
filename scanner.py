@@ -1,4 +1,4 @@
-# Pump.fun Daily Runner Scanner
+Runner Scanner
 # Finds pump.fun tokens with over 1000000 USD volume, 300 holders min, no honeypots.
 # Posts a clean copyable list to Telegram. Responds to /dailyscan command.
 
@@ -114,8 +114,8 @@ def save_results(scan_date, tokens):
 
 
 # ===========================================================================
-# STEP 1 — DISCOVER tokens via Dexscreener (pump.fun blocks datacenter IPs)
-# We search Dexscreener for new Solana pairs and filter to pumpfun origin only.
+# STEP 1 — DISCOVER tokens via Dexscreener boosted/new tokens endpoints
+# Uses multiple Dexscreener endpoints to find new pump.fun tokens
 # ===========================================================================
 
 async def discover_tokens(client):
@@ -124,50 +124,39 @@ async def discover_tokens(client):
     )
     tokens = {}
 
-    # Use Dexscreener latest pairs endpoint for Solana
-    endpoints = [
-        f"{DEXSCREENER}/latest/dex/search?q=raydium+solana",
-        f"{DEXSCREENER}/latest/dex/search?q=pumpfun",
-        f"{DEXSCREENER}/token-profiles/latest/v1",
-    ]
-
-    for url in endpoints:
-        try:
-            r = await client.get(url, timeout=20)
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            pairs = data.get("pairs") or (data if isinstance(data, list) else [])
-        except Exception as e:
-            logger.warning(f"Dexscreener endpoint error {url}: {e}")
-            continue
-
+    def process_pairs(pairs):
         for pair in pairs:
-            if isinstance(pair, dict) and pair.get("chainId") != "solana":
+            if not isinstance(pair, dict):
                 continue
-            if isinstance(pair, dict) and pair.get("dexId") not in ("pumpfun", "raydium"):
+            if pair.get("chainId") != "solana":
                 continue
-
-            created_ms = 0
-            if isinstance(pair, dict):
-                created_ms = pair.get("pairCreatedAt") or 0
+            # Accept pumpfun and raydium (raydium is where pumpfun tokens graduate to)
+            if pair.get("dexId") not in ("pumpfun", "raydium"):
+                continue
+            created_ms = pair.get("pairCreatedAt") or 0
             if created_ms < cutoff_ms:
                 continue
-
-            base = {}
-            if isinstance(pair, dict):
-                base = pair.get("baseToken") or {}
+            base = pair.get("baseToken") or {}
             mint = base.get("address", "").strip()
             if not mint:
-                continue
-
+                return
             vol = float((pair.get("volume") or {}).get("h24") or 0)
             liq = float((pair.get("liquidity") or {}).get("usd") or 0)
             txns_h24 = (pair.get("txns") or {}).get("h24") or {}
             buys = int(txns_h24.get("buys") or 0)
             sells = int(txns_h24.get("sells") or 0)
-
             if mint not in tokens or vol > tokens[mint].get("volume", 0):
+                # Extract social links from Dexscreener info field
+                info = pair.get("info") or {}
+                websites = info.get("websites") or []
+                socials = info.get("socials") or []
+                website_url = websites[0].get("url", "") if websites else ""
+                twitter_url = ""
+                for s in socials:
+                    if s.get("type") == "twitter":
+                        twitter_url = s.get("url", "")
+                        break
+
                 tokens[mint] = {
                     "mint": mint,
                     "name": base.get("name") or "Unknown",
@@ -183,11 +172,66 @@ async def discover_tokens(client):
                     "market_cap": pair.get("marketCap"),
                     "price_change": float((pair.get("priceChange") or {}).get("h24") or 0),
                     "pair_created_ms": created_ms,
+                    "website": website_url,
+                    "twitter": twitter_url,
                 }
+
+    # 1. Get token addresses from Dexscreener's boosted/new token endpoints
+    profile_mints = []
+    for profile_url in [
+        f"{DEXSCREENER}/token-profiles/latest/v1",
+        f"{DEXSCREENER}/token-boosts/latest/v1",
+        f"{DEXSCREENER}/token-boosts/top/v1",
+    ]:
+        try:
+            r = await client.get(profile_url, timeout=20)
+            if r.status_code == 200:
+                items = r.json()
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, dict) and item.get("chainId") == "solana":
+                            addr = item.get("tokenAddress", "").strip()
+                            if addr:
+                                profile_mints.append(addr)
+        except Exception as e:
+            logger.warning(f"Profile endpoint error {profile_url}: {e}")
+        await asyncio.sleep(0.2)
+
+    logger.info(f"Got {len(profile_mints)} token addresses from Dexscreener profiles")
+
+    # 2. Batch fetch pair data for all those mints
+    batch_size = 30
+    for i in range(0, len(profile_mints), batch_size):
+        batch = profile_mints[i:i + batch_size]
+        try:
+            r = await client.get(
+                f"{DEXSCREENER}/latest/dex/tokens/{','.join(batch)}",
+                timeout=20,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                process_pairs(data.get("pairs") or [])
+        except Exception as e:
+            logger.warning(f"Batch lookup error: {e}")
+        await asyncio.sleep(0.25)
+
+    # 3. Also try direct Dexscreener search for pumpfun pairs
+    for query in ["pump.fun", "pumpfun solana"]:
+        try:
+            r = await client.get(
+                f"{DEXSCREENER}/latest/dex/search",
+                params={"q": query},
+                timeout=20,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                process_pairs(data.get("pairs") or [])
+        except Exception as e:
+            logger.warning(f"Search error for '{query}': {e}")
         await asyncio.sleep(0.25)
 
     result = list(tokens.values())
-    logger.info(f"Discovered {len(result)} tokens from Dexscreener in last {MAX_TOKEN_AGE_HOURS}h")
+    logger.info(f"Discovered {len(result)} tokens in last {MAX_TOKEN_AGE_HOURS}h")
     return result
 
 
@@ -215,6 +259,8 @@ async def enrich_tokens(client, tokens):
                 "buys": t.get("buys", 0),
                 "sells": t.get("sells", 0),
                 "pair_created_ms": t.get("pair_created_ms"),
+                "website": t.get("website", ""),
+                "twitter": t.get("twitter", ""),
             }
 
     logger.info(f"Enriched: {len(enriched)}/{len(tokens)} tokens have Dexscreener data")
@@ -375,6 +421,8 @@ def build_result(token, dex, discovered_count):
         "name": token["name"],
         "symbol": token["symbol"],
         "url": dex["url"],
+        "website": dex.get("website") or token.get("website", ""),
+        "twitter": dex.get("twitter") or token.get("twitter", ""),
         "age_hours": age_hours,
         "volume": dex["volume"],
         "liquidity": dex["liquidity"],
@@ -435,89 +483,68 @@ async def send_telegram(client, text):
         logger.error(f"Telegram send failed: {e}")
 
 
+def build_token_entry(t, rank):
+    emoji = risk_emoji(t["label"])
+    vol = fmt(t["volume"])
+    mcap = fmt(t["market_cap"]) if t.get("market_cap") else "N/A"
+    pc = f"{t['price_change']:+.0f}%"
+    age = f"{t['age_hours']:.1f}h"
+    score = t["score"]
+    rank_icon = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"{rank}.")
+
+    # Build links line — always show Dexscreener, optionally X and Website
+    links = [f"<a href=\"{t['url']}\">Dexscreener</a>"]
+    if t.get("twitter"):
+        links.append(f"<a href=\"{t['twitter']}\">X</a>")
+    if t.get("website"):
+        links.append(f"<a href=\"{t['website']}\">Website</a>")
+    links_line = " | ".join(links)
+
+    return (
+        f"{rank_icon} <b>{t['name']}</b> <code>${t['symbol']}</code>\n"
+        f"   Vol: <b>{vol}</b> | MCap: {mcap} | {pc} | {age} old\n"
+        f"   Risk: {emoji} {score}/100\n"
+        f"   CA: <code>{t['mint']}</code>\n"
+        f"   {links_line}"
+    )
+
+
 def build_token_list_message(tokens, scan_date):
-    """
-    Builds a clean Telegram message listing all runners.
-    Token name is bold, contract address is in <code> tags
-    so users can tap to copy it directly in Telegram.
-    """
     now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    lines = [
-        f"🔥 <b>Pump.fun Runners — {scan_date}</b>",
-        f"<i>{len(tokens)} tokens | $1M+ vol | 300+ holders | no honeypots</i>",
-        f"<i>Scan time: {now_str}</i>\n",
-    ]
-
-    for i, t in enumerate(tokens, 1):
-        emoji = risk_emoji(t["label"])
-        vol = fmt(t["volume"])
-        mcap = fmt(t["market_cap"]) if t.get("market_cap") else "N/A"
-        holders = f"{t.get('holders', 0):,}"
-        pc = f"{t['price_change']:+.0f}%"
-        age = f"{t['age_hours']:.1f}h"
-        score = t["score"]
-
-        # Medal for top 3
-        rank_icon = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
-
-        lines.append(
-            f"{rank_icon} <b>{t['name']}</b> <code>${t['symbol']}</code>\n"
-            f"   Vol: <b>{vol}</b> | MCap: {mcap} | {pc} | {age} old\n"
-            f"   Holders: {holders} | Risk: {emoji} {score}/100\n"
-            f"   CA: <code>{t['mint']}</code>\n"
-            f"   <a href=\"{t['url']}\">Dexscreener</a>"
-        )
-
-    return "\n".join(lines)
+    header = (
+        f"🔥 <b>Potential Farms — {scan_date}</b>\n"
+        f"<i>{len(tokens)} tokens | $1M+ vol | no honeypots | {now_str}</i>"
+    )
+    entries = [build_token_entry(t, i) for i, t in enumerate(tokens, 1)]
+    return header + "\n\n" + "\n\n".join(entries)
 
 
 async def send_results(client, tokens, scan_date):
-    """
-    Sends results as a paginated list (Telegram max 4096 chars per message).
-    Splits into multiple messages if needed.
-    """
     if not tokens:
         await send_telegram(
             client,
-            f"📭 <b>Pump.fun scan — {scan_date}</b>\n\n"
+            f"📭 <b>Potential Farms — {scan_date}</b>\n\n"
             f"No tokens matched today's criteria:\n"
             f"• $1M+ volume\n"
-            f"• 300+ holders\n"
             f"• No honeypots\n"
             f"• No extreme wash trading",
         )
         return
 
-    # Split into chunks of 5 tokens per message to stay under 4096 char limit
-    chunk_size = 5
-    chunks = [tokens[i:i + chunk_size] for i in range(0, len(tokens), chunk_size)]
+    # Header message
+    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    header = (
+        f"🔥 <b>Potential Farms — {scan_date}</b>\n"
+        f"<i>{len(tokens)} tokens | $1M+ vol | no honeypots | {now_str}</i>"
+    )
+    await send_telegram(client, header)
+    await asyncio.sleep(0.3)
 
-    for idx, chunk in enumerate(chunks):
-        if idx == 0:
-            msg = build_token_list_message(chunk, scan_date)
-            # Add summary header only to first message
-        else:
-            # Continuation messages
-            lines = [f"<i>...continued ({idx * chunk_size + 1}–{min((idx + 1) * chunk_size, len(tokens))} of {len(tokens)})</i>\n"]
-            for i, t in enumerate(chunk, idx * chunk_size + 1):
-                emoji = risk_emoji(t["label"])
-                vol = fmt(t["volume"])
-                mcap = fmt(t["market_cap"]) if t.get("market_cap") else "N/A"
-                holders = f"{t.get('holders', 0):,}"
-                pc = f"{t['price_change']:+.0f}%"
-                age = f"{t['age_hours']:.1f}h"
-                score = t["score"]
-                lines.append(
-                    f"{i}. <b>{t['name']}</b> <code>${t['symbol']}</code>\n"
-                    f"   Vol: <b>{vol}</b> | MCap: {mcap} | {pc} | {age} old\n"
-                    f"   Holders: {holders} | Risk: {emoji} {score}/100\n"
-                    f"   CA: <code>{t['mint']}</code>\n"
-                    f"   <a href=\"{t['url']}\">Dexscreener</a>"
-                )
-            msg = "\n".join(lines)
-
+    # Send each token as its own message so it's clean and easy to read
+    for i, t in enumerate(tokens, 1):
+        msg = build_token_entry(t, i)
         await send_telegram(client, msg)
-        await asyncio.sleep(0.5)  # Small delay between messages
+        await asyncio.sleep(0.3)
 
 
 # ===========================================================================
@@ -660,7 +687,7 @@ async def poll_telegram_commands():
                         await send_telegram(
                             client,
                             f"🔍 <b>Scan started by {user}...</b>\n"
-                            f"<i>Fetching pump.fun tokens, this takes ~1 minute.</i>",
+                            f"<i>Fetching for potential farms, this takes ~1 minute.</i>",
                         )
 
                         try:
@@ -717,3 +744,4 @@ if __name__ == "__main__":
         run()
     else:
         asyncio.run(main_async())
+        
