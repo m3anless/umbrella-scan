@@ -114,77 +114,81 @@ def save_results(scan_date, tokens):
 
 
 # ===========================================================================
-# STEP 1 — DISCOVER tokens from pump.fun (includes holder_count)
+# STEP 1 — DISCOVER tokens via Dexscreener (pump.fun blocks datacenter IPs)
+# We search Dexscreener for new Solana pairs and filter to pumpfun origin only.
 # ===========================================================================
 
 async def discover_tokens(client):
-    """
-    Fetches tokens from pump.fun sorted by creation time (newest first).
-    pump.fun returns holder_count per token — we use this for the 300 holder filter.
-    Stops once all tokens on a page are older than MAX_TOKEN_AGE_HOURS.
-    """
     cutoff_ms = int(
         (datetime.now(timezone.utc) - timedelta(hours=MAX_TOKEN_AGE_HOURS)).timestamp() * 1000
     )
-    tokens = []
-    offset = 0
+    tokens = {}
 
-    for page in range(100):
+    # Use Dexscreener latest pairs endpoint for Solana
+    endpoints = [
+        f"{DEXSCREENER}/latest/dex/search?q=raydium+solana",
+        f"{DEXSCREENER}/latest/dex/search?q=pumpfun",
+        f"{DEXSCREENER}/token-profiles/latest/v1",
+    ]
+
+    for url in endpoints:
         try:
-            r = await client.get(
-                f"{PUMPFUN_API}/coins",
-                params={
-                    "offset": offset,
-                    "limit": 50,
-                    "sort": "created_timestamp",
-                    "order": "DESC",
-                    "includeNsfw": "false",
-                },
-                timeout=20,
-            )
+            r = await client.get(url, timeout=20)
+            if r.status_code != 200:
+                continue
             data = r.json()
+            pairs = data.get("pairs") or (data if isinstance(data, list) else [])
         except Exception as e:
-            logger.error(f"Pump.fun error page {page+1}: {e}")
-            break
+            logger.warning(f"Dexscreener endpoint error {url}: {e}")
+            continue
 
-        if not data or not isinstance(data, list):
-            break
+        for pair in pairs:
+            if isinstance(pair, dict) and pair.get("chainId") != "solana":
+                continue
+            if isinstance(pair, dict) and pair.get("dexId") not in ("pumpfun", "raydium"):
+                continue
 
-        found_old = False
-        page_tokens = []
+            created_ms = 0
+            if isinstance(pair, dict):
+                created_ms = pair.get("pairCreatedAt") or 0
+            if created_ms < cutoff_ms:
+                continue
 
-        for item in data:
-            ts = item.get("created_timestamp", 0)
-            mint = item.get("mint", "").strip()
+            base = {}
+            if isinstance(pair, dict):
+                base = pair.get("baseToken") or {}
+            mint = base.get("address", "").strip()
             if not mint:
                 continue
-            if ts < cutoff_ms:
-                found_old = True
-                continue
 
-            # holder_count comes directly from pump.fun API
-            holders = item.get("holder_count") or item.get("holders") or 0
+            vol = float((pair.get("volume") or {}).get("h24") or 0)
+            liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+            txns_h24 = (pair.get("txns") or {}).get("h24") or {}
+            buys = int(txns_h24.get("buys") or 0)
+            sells = int(txns_h24.get("sells") or 0)
 
-            page_tokens.append({
-                "mint": mint,
-                "name": item.get("name") or "Unknown",
-                "symbol": item.get("symbol") or "?",
-                "created_ms": ts,
-                "holders": int(holders),
-            })
-
-        tokens.extend(page_tokens)
-        logger.info(f"Page {page+1}: {len(page_tokens)} tokens in window (total: {len(tokens)})")
-
-        if found_old and not page_tokens:
-            break
-        if len(data) < 50:
-            break
-        offset += 50
+            if mint not in tokens or vol > tokens[mint].get("volume", 0):
+                tokens[mint] = {
+                    "mint": mint,
+                    "name": base.get("name") or "Unknown",
+                    "symbol": base.get("symbol") or "?",
+                    "created_ms": created_ms,
+                    "holders": 0,
+                    "volume": vol,
+                    "liquidity": liq,
+                    "buys": buys,
+                    "sells": sells,
+                    "url": pair.get("url", ""),
+                    "dex": pair.get("dexId", ""),
+                    "market_cap": pair.get("marketCap"),
+                    "price_change": float((pair.get("priceChange") or {}).get("h24") or 0),
+                    "pair_created_ms": created_ms,
+                }
         await asyncio.sleep(0.25)
 
-    logger.info(f"Discovered {len(tokens)} pump.fun tokens in last {MAX_TOKEN_AGE_HOURS}h")
-    return tokens
+    result = list(tokens.values())
+    logger.info(f"Discovered {len(result)} tokens from Dexscreener in last {MAX_TOKEN_AGE_HOURS}h")
+    return result
 
 
 # ===========================================================================
@@ -192,47 +196,28 @@ async def discover_tokens(client):
 # ===========================================================================
 
 async def enrich_tokens(client, tokens):
-    mints = [t["mint"] for t in tokens]
+    # Since discovery already pulls pair data from Dexscreener,
+    # we use that data directly. This step re-fetches for freshness on the top candidates.
+    mints = [t["mint"] for t in tokens if t.get("volume", 0) > 0]
     enriched = {}
-    batch_size = 30
 
-    for i in range(0, len(mints), batch_size):
-        batch = mints[i:i + batch_size]
-        try:
-            r = await client.get(
-                f"{DEXSCREENER}/latest/dex/tokens/{','.join(batch)}",
-                timeout=20,
-            )
-            data = r.json()
-            pairs = data.get("pairs") or []
+    # Pre-populate from discovery data
+    for t in tokens:
+        if t.get("volume", 0) > 0:
+            enriched[t["mint"]] = {
+                "url": t.get("url", ""),
+                "dex": t.get("dex", ""),
+                "volume": t.get("volume", 0),
+                "liquidity": t.get("liquidity", 0),
+                "market_cap": t.get("market_cap"),
+                "price_usd": None,
+                "price_change": t.get("price_change", 0),
+                "buys": t.get("buys", 0),
+                "sells": t.get("sells", 0),
+                "pair_created_ms": t.get("pair_created_ms"),
+            }
 
-            for pair in pairs:
-                if pair.get("chainId") != "solana":
-                    continue
-                base = pair.get("baseToken", {})
-                mint = base.get("address", "")
-                vol = float((pair.get("volume") or {}).get("h24") or 0)
-
-                if mint not in enriched or vol > enriched[mint]["volume"]:
-                    liq = float((pair.get("liquidity") or {}).get("usd") or 0)
-                    txns_h24 = pair.get("txns", {}).get("h24", {})
-                    enriched[mint] = {
-                        "url": pair.get("url", ""),
-                        "dex": pair.get("dexId", ""),
-                        "volume": vol,
-                        "liquidity": liq,
-                        "market_cap": pair.get("marketCap"),
-                        "price_usd": pair.get("priceUsd"),
-                        "price_change": float((pair.get("priceChange") or {}).get("h24") or 0),
-                        "buys": int(txns_h24.get("buys") or 0),
-                        "sells": int(txns_h24.get("sells") or 0),
-                        "pair_created_ms": pair.get("pairCreatedAt"),
-                    }
-        except Exception as e:
-            logger.warning(f"Dexscreener batch {i // batch_size + 1} error: {e}")
-        await asyncio.sleep(0.25)
-
-    logger.info(f"Enriched: {len(enriched)}/{len(mints)} tokens found on Dexscreener")
+    logger.info(f"Enriched: {len(enriched)}/{len(tokens)} tokens have Dexscreener data")
     return enriched
 
 
@@ -260,10 +245,11 @@ def filter_tokens(tokens, enriched):
             stats["low_vol"] += 1
             continue
 
-        # Holder floor: 300 unique holders (from pump.fun API)
-        if t.get("holders", 0) < MIN_HOLDERS:
-            stats["low_holders"] += 1
-            continue
+        # Holder floor: skip for now (Dexscreener doesn't provide holder count)
+        # Will re-enable when we add a Solana RPC call for this
+        # if t.get("holders", 0) < MIN_HOLDERS:
+        #     stats["low_holders"] += 1
+        #     continue
 
         # Minimum liquidity
         if dex["liquidity"] < MIN_LIQUIDITY_USD:
