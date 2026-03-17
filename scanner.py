@@ -1,6 +1,7 @@
 # Pump.fun Runner Scanner
-# Finds tokens on PumpSwap with over 1M USD volume, launched in last 24h.
-# Uses Dexscreener API only. Posts to Telegram. Responds to /dailyscan.
+# Finds PumpSwap tokens with $1M+ vol in last 24h.
+# Shows top 30 traders: avg entry, avg exit, total PnL extracted.
+# Uses Dexscreener API only.
 
 import asyncio
 import csv
@@ -31,12 +32,20 @@ TOP_N               = int(os.getenv("TOP_N", "20"))
 SCHEDULE_HOUR       = int(os.getenv("SCHEDULE_HOUR", "0"))
 SCHEDULE_MINUTE     = int(os.getenv("SCHEDULE_MINUTE", "5"))
 
-DEXSCREENER = "https://api.dexscreener.com"
-DB_PATH     = "scanner.db"
-OUTPUT_DIR  = Path("output")
+DEXSCREENER      = "https://api.dexscreener.com"
+DEXSCREENER_IO   = "https://io.dexscreener.com"
+DB_PATH          = "scanner.db"
+OUTPUT_DIR       = Path("output")
 
-# PumpSwap DEX IDs on Dexscreener
 PUMPSWAP_DEX_IDS = {"pumpfun", "pumpswap", "pump-fun", "pump_fun"}
+
+SEARCH_QUERIES = [
+    "pumpswap", "pump.fun", "pumpfun",
+    "solana meme coin", "solana dog", "solana cat",
+    "solana ai", "solana trump", "solana pepe",
+    "solana based", "solana inu", "solana moon",
+    "solana chad", "solana elon", "solana grok",
+]
 
 # ===========================================================================
 # DATABASE
@@ -62,8 +71,11 @@ def init_db():
             price_change REAL,
             buys INTEGER,
             sells INTEGER,
-            score INTEGER,
-            label TEXT,
+            total_extracted REAL,
+            avg_entry REAL,
+            avg_exit REAL,
+            trader_count INTEGER,
+            traders_json TEXT,
             flags TEXT,
             created_at TEXT
         )
@@ -77,7 +89,7 @@ def init_db():
             winner_name TEXT,
             winner_symbol TEXT,
             winner_volume REAL,
-            winner_score INTEGER
+            winner_extracted REAL
         )
     """)
     conn.commit()
@@ -88,11 +100,13 @@ def save_results(scan_date, tokens):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("DELETE FROM results WHERE scan_date=?", (scan_date,))
     for rank, t in enumerate(tokens, 1):
+        traders = t.get("traders") or {}
         conn.execute("""
             INSERT INTO results
             (scan_date,rank,mint,name,symbol,url,website,twitter,age_hours,volume,liquidity,
-             market_cap,price_change,buys,sells,score,label,flags,created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             market_cap,price_change,buys,sells,total_extracted,avg_entry,avg_exit,
+             trader_count,traders_json,flags,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             scan_date, rank,
             t["mint"], t["name"], t["symbol"], t["url"],
@@ -100,35 +114,30 @@ def save_results(scan_date, tokens):
             t["age_hours"], t["volume"], t["liquidity"],
             t.get("market_cap"), t["price_change"],
             t["buys"], t["sells"],
-            t["score"], t["label"],
-            json.dumps(t["flags"]),
+            traders.get("total_extracted", 0),
+            traders.get("avg_entry", 0),
+            traders.get("avg_exit", 0),
+            traders.get("trader_count", 0),
+            json.dumps(traders),
+            json.dumps(t.get("flags", [])),
             datetime.now(timezone.utc).isoformat()
         ))
     if tokens:
         w = tokens[0]
         conn.execute("""
             INSERT OR REPLACE INTO daily
-            (scan_date,discovered,passed,winner_name,winner_symbol,winner_volume,winner_score)
+            (scan_date,discovered,passed,winner_name,winner_symbol,winner_volume,winner_extracted)
             VALUES (?,?,?,?,?,?,?)
         """, (scan_date, t.get("discovered", 0), len(tokens),
-              w["name"], w["symbol"], w["volume"], w["score"]))
+              w["name"], w["symbol"], w["volume"],
+              (w.get("traders") or {}).get("total_extracted", 0)))
     conn.commit()
     conn.close()
 
 
 # ===========================================================================
 # STEP 1 — DISCOVER via Dexscreener search
-# Cast a wide net: multiple search queries targeting PumpSwap tokens.
-# Each query returns up to 30 pairs. We deduplicate by mint address.
 # ===========================================================================
-
-SEARCH_QUERIES = [
-    "pumpswap", "pump.fun", "pumpfun",
-    "solana meme coin", "solana dog", "solana cat",
-    "solana ai", "solana trump", "solana pepe",
-    "solana based", "solana inu", "solana moon",
-    "solana chad", "solana elon", "solana grok",
-]
 
 async def discover_tokens(client):
     cutoff_ms = int(
@@ -172,6 +181,8 @@ async def discover_tokens(client):
                 "buys": buys,
                 "sells": sells,
                 "url": pair.get("url", ""),
+                "pair_address": pair.get("pairAddress", ""),
+                "price_usd": pair.get("priceUsd", "0"),
                 "dex": dex_id,
                 "market_cap": pair.get("marketCap"),
                 "price_change": float((pair.get("priceChange") or {}).get("h24") or 0),
@@ -194,37 +205,38 @@ async def discover_tokens(client):
                     ingest_pair(pair)
                 new = len(tokens) - before
                 if new > 0:
-                    logger.info(f"Query '{query}': +{new} new tokens (total: {len(tokens)})")
+                    logger.info(f"Query '{query}': +{new} (total: {len(tokens)})")
         except Exception as e:
             logger.warning(f"Search error '{query}': {e}")
         await asyncio.sleep(0.3)
 
     result = list(tokens.values())
-    logger.info(f"Discovery complete: {len(result)} PumpSwap tokens in last {MAX_TOKEN_AGE_HOURS}h")
+    logger.info(f"Discovery: {len(result)} PumpSwap tokens in last {MAX_TOKEN_AGE_HOURS}h")
     return result
 
 
 # ===========================================================================
-# STEP 2 — ENRICH (data already in discovery, just pass through)
+# STEP 2 — ENRICH (pass-through)
 # ===========================================================================
 
 async def enrich_tokens(client, tokens):
     enriched = {}
     for t in tokens:
-        if t.get("volume", 0) >= 0:
-            enriched[t["mint"]] = {
-                "url": t.get("url", ""),
-                "dex": t.get("dex", ""),
-                "volume": t.get("volume", 0),
-                "liquidity": t.get("liquidity", 0),
-                "market_cap": t.get("market_cap"),
-                "price_change": t.get("price_change", 0),
-                "buys": t.get("buys", 0),
-                "sells": t.get("sells", 0),
-                "pair_created_ms": t.get("pair_created_ms"),
-                "website": t.get("website", ""),
-                "twitter": t.get("twitter", ""),
-            }
+        enriched[t["mint"]] = {
+            "url": t.get("url", ""),
+            "pair_address": t.get("pair_address", ""),
+            "dex": t.get("dex", ""),
+            "volume": t.get("volume", 0),
+            "liquidity": t.get("liquidity", 0),
+            "market_cap": t.get("market_cap"),
+            "price_usd": t.get("price_usd", "0"),
+            "price_change": t.get("price_change", 0),
+            "buys": t.get("buys", 0),
+            "sells": t.get("sells", 0),
+            "pair_created_ms": t.get("pair_created_ms"),
+            "website": t.get("website", ""),
+            "twitter": t.get("twitter", ""),
+        }
     return enriched
 
 
@@ -235,105 +247,179 @@ async def enrich_tokens(client, tokens):
 def filter_tokens(tokens, enriched):
     passed = []
     stats = {"no_dex": 0, "low_vol": 0, "low_liq": 0, "few_txns": 0, "honeypot": 0, "wash": 0}
-
     for t in tokens:
         dex = enriched.get(t["mint"])
         if not dex:
-            stats["no_dex"] += 1
-            continue
+            stats["no_dex"] += 1; continue
         if dex["volume"] < MIN_VOLUME_USD:
-            stats["low_vol"] += 1
-            continue
+            stats["low_vol"] += 1; continue
         if dex["liquidity"] < MIN_LIQUIDITY_USD:
-            stats["low_liq"] += 1
-            continue
+            stats["low_liq"] += 1; continue
         if dex["buys"] + dex["sells"] < MIN_TRANSACTIONS:
-            stats["few_txns"] += 1
-            continue
+            stats["few_txns"] += 1; continue
         if dex["buys"] >= 20 and dex["sells"] == 0:
-            stats["honeypot"] += 1
-            logger.debug(f"Honeypot filtered: {t['symbol']}")
-            continue
+            stats["honeypot"] += 1; continue
         if dex["liquidity"] > 0 and dex["volume"] / dex["liquidity"] > 1000:
-            stats["wash"] += 1
-            logger.debug(f"Wash trade filtered: {t['symbol']}")
-            continue
+            stats["wash"] += 1; continue
         passed.append((t, dex))
-
     logger.info(
-        f"Filters: no_dex={stats['no_dex']} low_vol={stats['low_vol']} "
-        f"low_liq={stats['low_liq']} few_txns={stats['few_txns']} "
-        f"honeypot={stats['honeypot']} wash={stats['wash']} "
-        f"PASSED={len(passed)}"
+        f"Filters: low_vol={stats['low_vol']} low_liq={stats['low_liq']} "
+        f"few_txns={stats['few_txns']} honeypot={stats['honeypot']} "
+        f"wash={stats['wash']} PASSED={len(passed)}"
     )
     return passed
 
 
 # ===========================================================================
-# STEP 4 — SCORE (manipulation risk 0-100)
+# STEP 4 — TOP TRADERS from Dexscreener
+# Uses the same endpoint that powers the "Top Traders" tab on dexscreener.com
+# Returns: total extracted, avg entry, avg exit for top 30 traders
 # ===========================================================================
 
-def score_token(dex):
-    score = 0
-    flags = []
-    vol = dex["volume"]
-    liq = max(dex["liquidity"], 1)
-    buys = dex["buys"]
-    sells = dex["sells"]
-    total = buys + sells
-    mcap = dex.get("market_cap") or 0
+async def get_top_traders(client, pair_address, mint):
+    """
+    Fetches top traders from Dexscreener's internal API.
+    This is the same data shown in the Top Traders tab on the pair page.
+    """
+    if not pair_address:
+        return {}
 
-    ratio = vol / liq
-    if ratio > 500:
-        score += 30; flags.append(f"Extreme vol/liq ratio ({ratio:.0f}x)")
-    elif ratio > 200:
-        score += 20; flags.append(f"Very high vol/liq ratio ({ratio:.0f}x)")
-    elif ratio > 100:
-        score += 10; flags.append(f"Elevated vol/liq ratio ({ratio:.0f}x)")
-    elif ratio > 50:
-        score += 4
+    result = {
+        "trader_count": 0,
+        "total_extracted": 0.0,
+        "avg_entry": 0.0,
+        "avg_exit": 0.0,
+        "top_traders": [],
+    }
 
-    if total > 0 and sells > 0:
-        buy_ratio = buys / total
-        if buy_ratio > 0.95:
-            score += 20; flags.append(f"Extreme buy ratio ({buy_ratio:.0%})")
-        elif buy_ratio > 0.90:
-            score += 12; flags.append(f"High buy ratio ({buy_ratio:.0%})")
-        elif buy_ratio > 0.85:
-            score += 5
+    try:
+        # Dexscreener's top traders endpoint (powers their UI tab)
+        r = await client.get(
+            f"{DEXSCREENER_IO}/dex/top-traders/v2/solana/{pair_address}",
+            params={"rankBy": "profitAndLoss", "order": "desc"},
+            headers={
+                "Accept": "application/json",
+                "Origin": "https://dexscreener.com",
+                "Referer": f"https://dexscreener.com/solana/{pair_address}",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            },
+            timeout=15,
+        )
 
-    if total > 0:
-        avg = vol / total
-        if avg > 100000:
-            score += 20; flags.append(f"Huge avg txn (${avg:,.0f})")
-        elif avg > 50000:
-            score += 14; flags.append(f"Large avg txn (${avg:,.0f})")
-        elif avg > 20000:
-            score += 8; flags.append(f"Elevated avg txn (${avg:,.0f})")
+        if r.status_code != 200:
+            logger.debug(f"Top traders: {r.status_code} for pair {pair_address[:8]}")
+            return result
 
-    if mcap > 0:
-        lm = liq / mcap
-        if lm < 0.003:
-            score += 15; flags.append(f"Dangerous liq/mcap ({lm:.2%})")
-        elif lm < 0.01:
-            score += 8; flags.append(f"Low liq/mcap ({lm:.2%})")
+        data = r.json()
+        # Dexscreener returns the top traders as a list
+        traders_raw = data if isinstance(data, list) else (data.get("data") or data.get("traders") or [])
 
-    score = min(score, 100)
-    if score <= 20:   label = "Organic"
-    elif score <= 40: label = "Likely Organic"
-    elif score <= 65: label = "Suspicious"
-    else:             label = "Likely Manipulated"
-    return score, label, flags
+        if not traders_raw:
+            return result
+
+        # Limit to top 30
+        traders_raw = traders_raw[:30]
+
+        entries = []
+        exits = []
+        total_pnl = 0.0
+        profitable_count = 0
+        trader_summaries = []
+
+        for trader in traders_raw:
+            # Different possible field names from Dexscreener
+            pnl = float(
+                trader.get("profitAndLoss") or
+                trader.get("pnl") or
+                trader.get("realizedProfit") or 0
+            )
+            bought_usd = float(
+                trader.get("volumeBought") or
+                trader.get("bought") or
+                trader.get("boughtAmountUsd") or 0
+            )
+            sold_usd = float(
+                trader.get("volumeSold") or
+                trader.get("sold") or
+                trader.get("soldAmountUsd") or 0
+            )
+            bought_tokens = float(trader.get("tokensBought") or trader.get("boughtAmount") or 0)
+            sold_tokens = float(trader.get("tokensSold") or trader.get("soldAmount") or 0)
+            wallet = trader.get("address") or trader.get("maker") or "?"
+
+            # Avg entry = USD spent / tokens bought
+            if bought_tokens > 0 and bought_usd > 0:
+                avg_entry = bought_usd / bought_tokens
+                entries.append(avg_entry)
+
+            # Avg exit = USD received / tokens sold
+            if sold_tokens > 0 and sold_usd > 0:
+                avg_exit = sold_usd / sold_tokens
+                exits.append(avg_exit)
+
+            if pnl > 0:
+                total_pnl += pnl
+                profitable_count += 1
+
+            trader_summaries.append({
+                "wallet": wallet[:8] + "..." if len(wallet) > 8 else wallet,
+                "pnl_usd": round(pnl, 2),
+                "bought_usd": round(bought_usd, 2),
+                "sold_usd": round(sold_usd, 2),
+            })
+
+        result["trader_count"] = len(traders_raw)
+        result["total_extracted"] = round(total_pnl, 2)
+        result["avg_entry"] = round(sum(entries) / len(entries), 10) if entries else 0
+        result["avg_exit"] = round(sum(exits) / len(exits), 10) if exits else 0
+        result["profitable_count"] = profitable_count
+        result["top_traders"] = trader_summaries[:5]  # Store top 5 for display
+
+        logger.info(
+            f"Top traders for {mint[:8]}: {len(traders_raw)} traders, "
+            f"extracted=${total_pnl:,.0f}"
+        )
+
+    except Exception as e:
+        logger.warning(f"Top traders error for {pair_address[:8]}: {e}")
+
+    return result
 
 
-def build_result(token, dex, discovered_count):
+# ===========================================================================
+# STEP 5 — BUILD RESULT
+# ===========================================================================
+
+def build_result(token, dex, traders, discovered_count):
     now = datetime.now(timezone.utc)
     launch_ms = dex.get("pair_created_ms") or token.get("created_ms")
     age_hours = 0.0
     if launch_ms:
         launch_dt = datetime.fromtimestamp(launch_ms / 1000, tz=timezone.utc)
         age_hours = round((now - launch_dt).total_seconds() / 3600, 2)
-    score, label, flags = score_token(dex)
+
+    flags = []
+    vol = dex["volume"]
+    liq = max(dex["liquidity"], 1)
+    ratio = vol / liq
+    if ratio > 200:
+        flags.append(f"High vol/liq ratio ({ratio:.0f}x)")
+
+    # Derive current price from mcap and supply estimate
+    # current_price = mcap / total_supply
+    # We can't get supply directly, but we store it so the display layer can do:
+    # mcap_at_entry = (avg_entry_price / current_price) * current_mcap
+    current_mcap = dex.get("market_cap") or 0
+    current_price_str = token.get("price_usd") or dex.get("price_usd") or "0"
+    try:
+        current_price = float(current_price_str)
+    except Exception:
+        current_price = 0.0
+
+    # Store current price in traders dict for the display layer
+    if traders and current_price > 0:
+        traders["current_price"] = current_price
+
     return {
         "mint": token["mint"],
         "name": token["name"],
@@ -341,31 +427,39 @@ def build_result(token, dex, discovered_count):
         "url": dex["url"],
         "website": dex.get("website", ""),
         "twitter": dex.get("twitter", ""),
+        "pair_address": dex.get("pair_address", ""),
         "age_hours": age_hours,
         "volume": dex["volume"],
         "liquidity": dex["liquidity"],
-        "market_cap": dex.get("market_cap"),
+        "market_cap": current_mcap,
         "price_change": dex["price_change"],
         "buys": dex["buys"],
         "sells": dex["sells"],
-        "score": score,
-        "label": label,
+        "traders": traders,
         "flags": flags,
         "discovered": discovered_count,
     }
 
 
 # ===========================================================================
-# STEP 5 — TELEGRAM
+# STEP 6 — TELEGRAM FORMATTING
 # ===========================================================================
 
 def fmt(v):
+    if not v:
+        return "N/A"
+    v = float(v)
     if v >= 1000000: return f"${v/1000000:.1f}M"
     if v >= 1000:    return f"${v/1000:.0f}K"
     return f"${v:.0f}"
 
-def risk_emoji(label):
-    return {"Organic":"✅","Likely Organic":"🟢","Suspicious":"🟡","Likely Manipulated":"🔴"}.get(label,"❓")
+def fmt_price(v):
+    if not v or v == 0:
+        return "N/A"
+    v = float(v)
+    if v >= 0.01:    return f"${v:.4f}"
+    if v >= 0.0001:  return f"${v:.6f}"
+    return f"${v:.10f}"
 
 async def send_telegram(client, text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -385,22 +479,68 @@ async def send_telegram(client, text):
     except Exception as e:
         logger.error(f"Telegram failed: {e}")
 
+def price_to_mcap(price, current_price, current_mcap):
+    """
+    Convert a price point to the market cap at that price.
+    Formula: mcap_at_price = (price / current_price) * current_mcap
+    This tells you what the market cap was when traders entered/exited.
+    """
+    if not price or not current_price or not current_mcap:
+        return None
+    if current_price <= 0:
+        return None
+    return (price / current_price) * current_mcap
+
+
 def build_token_entry(t, rank):
-    emoji = risk_emoji(t["label"])
     vol = fmt(t["volume"])
-    mcap = fmt(t["market_cap"]) if t.get("market_cap") else "N/A"
+    current_mcap = t.get("market_cap") or 0
+    mcap = fmt(current_mcap) if current_mcap else "N/A"
     pc = f"{t['price_change']:+.0f}%"
     age = f"{t['age_hours']:.1f}h"
     rank_icon = {1:"🥇",2:"🥈",3:"🥉"}.get(rank, f"{rank}.")
+
+    # Trader stats
+    traders = t.get("traders") or {}
+    extracted = traders.get("total_extracted", 0)
+    avg_entry_price = traders.get("avg_entry", 0)
+    avg_exit_price  = traders.get("avg_exit", 0)
+    n_traders = traders.get("trader_count", 0)
+    profitable = traders.get("profitable_count", 0)
+
+    # Convert avg entry/exit prices to market cap values
+    current_price = traders.get("current_price", 0)
+    mcap_at_entry = price_to_mcap(avg_entry_price, current_price, current_mcap)
+    mcap_at_exit  = price_to_mcap(avg_exit_price,  current_price, current_mcap)
+
+    entry_str = fmt(mcap_at_entry) if mcap_at_entry else "N/A"
+    exit_str  = fmt(mcap_at_exit)  if mcap_at_exit  else "N/A"
+
+    if extracted > 0:
+        trader_line = (
+            f"💸 <b>Top {n_traders} traders extracted: {fmt(extracted)}</b>\n"
+            f"   Avg entry mcap: {entry_str} | Avg exit mcap: {exit_str}\n"
+            f"   {profitable}/{n_traders} traders profitable"
+        )
+    elif n_traders > 0:
+        trader_line = (
+            f"💸 Top {n_traders} traders — no profitable exits yet\n"
+            f"   Avg entry mcap: {entry_str}"
+        )
+    else:
+        trader_line = "💸 Trader data: not available"
+
+    # Links
     links = [f"<a href=\"{t['url']}\">Dexscreener</a>"]
     if t.get("twitter"):
         links.append(f"<a href=\"{t['twitter']}\">X</a>")
     if t.get("website"):
         links.append(f"<a href=\"{t['website']}\">Website</a>")
+
     return (
         f"{rank_icon} <b>{t['name']}</b> <code>${t['symbol']}</code>\n"
         f"Vol: <b>{vol}</b> | MCap: {mcap} | {pc} | {age} old\n"
-        f"Risk: {emoji} {t['score']}/100\n"
+        f"{trader_line}\n"
         f"CA: <code>{t['mint']}</code>\n"
         f"{' | '.join(links)}"
     )
@@ -411,33 +551,26 @@ async def send_results(client, tokens, scan_date):
             f"📭 <b>Potential Farms — {scan_date}</b>\n\n"
             f"No PumpSwap tokens found with $1M+ volume in the last 24h.")
         return
+
     now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
     await send_telegram(client,
         f"🔥 <b>Potential Farms — {scan_date}</b>\n"
         f"<i>{len(tokens)} tokens | PumpSwap | $1M+ vol | {now_str}</i>")
     await asyncio.sleep(0.3)
+
     for i, t in enumerate(tokens, 1):
         await send_telegram(client, build_token_entry(t, i))
         await asyncio.sleep(0.3)
 
 
 # ===========================================================================
-# STEP 6 — EXPORT
+# STEP 7 — EXPORT
 # ===========================================================================
 
 def export_files(tokens, scan_date):
     OUTPUT_DIR.mkdir(exist_ok=True)
     with open(OUTPUT_DIR / f"{scan_date}_runners.json", "w") as f:
         json.dump({"scan_date": scan_date, "results": tokens}, f, indent=2, default=str)
-    if tokens:
-        fields = ["rank","name","symbol","mint","url","website","twitter","age_hours",
-                  "volume","liquidity","market_cap","price_change","buys","sells","score","label"]
-        with open(OUTPUT_DIR / f"{scan_date}_runners.csv", "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-            w.writeheader()
-            for rank, t in enumerate(tokens, 1):
-                row = dict(t); row["rank"] = rank
-                w.writerow({k: row.get(k,"") for k in fields})
     logger.info(f"Exported {len(tokens)} results")
 
 
@@ -453,21 +586,41 @@ async def run_scan(client=None):
     init_db()
 
     async def _scan(c):
+        # 1. Discover
         raw = await discover_tokens(c)
         if not raw:
-            logger.warning("No tokens discovered")
-            await send_telegram(c, f"No tokens found by Dexscreener scan ({scan_date})")
+            await send_telegram(c, f"No tokens found ({scan_date})")
             return []
+
+        # 2. Enrich
         enriched = await enrich_tokens(c, raw)
+
+        # 3. Filter
         passed = filter_tokens(raw, enriched)
         logger.info(f"Pipeline: {len(raw)} discovered -> {len(passed)} passed filters")
+
         if not passed:
             await send_results(c, [], scan_date)
             return []
-        results = [build_result(t, d, len(raw)) for t, d in passed]
+
+        # 4. Get top traders for each token
+        results = []
+        for token, dex in passed:
+            pair_addr = dex.get("pair_address", "")
+            traders = await get_top_traders(c, pair_addr, token["mint"])
+            await asyncio.sleep(0.3)
+            results.append(build_result(token, dex, traders, len(raw)))
+
+        # 5. Sort by volume
         results.sort(key=lambda x: x["volume"], reverse=True)
         top = results[:TOP_N]
-        logger.info(f"Winner: {top[0]['symbol']} vol={fmt(top[0]['volume'])} score={top[0]['score']}/100")
+
+        logger.info(
+            f"Winner: {top[0]['symbol']} "
+            f"vol={fmt(top[0]['volume'])} "
+            f"extracted={fmt((top[0].get('traders') or {}).get('total_extracted', 0))}"
+        )
+
         export_files(top, scan_date)
         save_results(scan_date, top)
         await send_results(c, top, scan_date)
@@ -477,7 +630,8 @@ async def run_scan(client=None):
         return await _scan(client)
     else:
         async with httpx.AsyncClient(
-            headers={"User-Agent": "Mozilla/5.0 (compatible; scanner/1.0)", "Accept": "application/json"},
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                     "Accept": "application/json"},
             follow_redirects=True,
         ) as c:
             return await _scan(c)
@@ -488,7 +642,7 @@ def run():
 
 
 # ===========================================================================
-# TELEGRAM BOT — /dailyscan command
+# TELEGRAM BOT
 # ===========================================================================
 
 async def poll_telegram_commands():
@@ -549,7 +703,8 @@ async def main_async():
     init_db()
     scheduler = BlockingScheduler(timezone="UTC")
     scheduler.add_job(run, CronTrigger(hour=SCHEDULE_HOUR, minute=SCHEDULE_MINUTE),
-                      id="daily_scan", replace_existing=True, misfire_grace_time=300, coalesce=True)
+                      id="daily_scan", replace_existing=True,
+                      misfire_grace_time=300, coalesce=True)
     t = threading.Thread(target=scheduler.start, daemon=True)
     t.start()
     logger.info(f"Scheduler started — daily at {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} UTC")
